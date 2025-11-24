@@ -1,71 +1,108 @@
-const crypto = require("crypto");
+// api/webhook.js
+const crypto = require('crypto');
+const { URLSearchParams } = require('url');
 
-const SECRET = process.env.GITHUB_WEBHOOK_SECRET || ""; // set in Vercel env vars
-// In-memory storage (ephemeral)
-if (!global.__gh_events) global.__gh_events = [];
-const events = global.__gh_events;
-
-function verifySignature(reqBody, header) {
-  if (!header) return false;
-  const sigParts = header.split("=");
-  if (sigParts.length !== 2) return false;
-  const algo = sigParts[0]; // should be 'sha256'
-  const signature = sigParts[1];
-
-  const hmac = crypto.createHmac("sha256", SECRET);
-  const digest = hmac.update(reqBody).digest("hex");
-  // timing-safe compare
-  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature));
+function safeEqual(a, b) {
+  try {
+    return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  } catch (e) {
+    return false;
+  }
 }
 
-module.exports = async function (req, res) {
-  if (req.method !== "POST") {
-    res.setHeader("Allow", "POST");
-    return res.status(405).send("Method Not Allowed");
+async function getRawBody(req) {
+  // accumulate raw bytes from the incoming request stream
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
+function computeHmacHex(secret, buf, algo = 'sha256') {
+  return crypto.createHmac(algo, secret).update(buf).digest('hex');
+}
+
+module.exports = async (req, res) => {
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
+    return res.status(405).send('Method Not Allowed');
   }
 
-  // Raw body is needed to verify signature correctly.
-  // Vercel provides body parsed by default; ensure raw body available.
-  // If using Next.js, use the raw body approach; here we assume the body is already parsed,
-  // so reconstruct canonical JSON string for signature (GitHub signs raw bytes).
-  // For a minimal approach, use X-Hub-Signature-256 verification computed from JSON.stringify(req.body)
-  const rawBody = JSON.stringify(req.body || {});
-  const sigHeader = req.headers["x-hub-signature-256"];
-
+  const SECRET = process.env.GITHUB_WEBHOOK_SECRET || '';
   if (!SECRET) {
-    console.warn(
-      "GITHUB_WEBHOOK_SECRET is not set. Signature verification disabled!"
-    );
-  } else if (!verifySignature(rawBody, sigHeader)) {
-    console.warn("Invalid GitHub webhook signature");
-    return res.status(401).send("Invalid signature");
+    console.warn('GITHUB_WEBHOOK_SECRET is not set!');
   }
 
-  const ghEvent = req.headers["x-github-event"] || "unknown";
-  const deliveryId = req.headers["x-github-delivery"] || "";
+  // Read raw bytes (important for correct signature verification)
+  const raw = await getRawBody(req); // Buffer
+  const contentType = (req.headers['content-type'] || '').toLowerCase();
 
-  // handle ping
-  if (ghEvent === "ping") {
-    events.unshift({
-      id: deliveryId,
-      type: "ping",
-      received_at: new Date().toISOString(),
-      payload: req.body,
+  // Headers from GitHub
+  const sig256Header = req.headers['x-hub-signature-256']; // "sha256=..."
+  const sig1Header = req.headers['x-hub-signature']; // "sha1=..."
+  const event = req.headers['x-github-event'] || 'unknown';
+  const delivery = req.headers['x-github-delivery'] || '';
+
+  // Compute expected HMACs
+  const expected256 = computeHmacHex(SECRET, raw, 'sha256'); // hex string
+  const expected1 = computeHmacHex(SECRET, raw, 'sha1'); // hex string
+
+  // Extract signature values from headers (strip algo=)
+  const header256 = sig256Header && sig256Header.startsWith('sha256=') ? sig256Header.slice(7) : sig256Header;
+  const header1 = sig1Header && sig1Header.startsWith('sha1=') ? sig1Header.slice(5) : sig1Header;
+
+  const valid256 = header256 ? safeEqual(header256, expected256) : false;
+  const valid1 = header1 ? safeEqual(header1, expected1) : false;
+
+  if (!valid256 && !valid1) {
+    // Debug helpers (DO NOT LOG SECRET)
+    console.warn('Webhook signature mismatch', {
+      has_sig256: !!sig256Header,
+      has_sig1: !!sig1Header,
+      expected256,
+      expected1,
+      header256,
+      header1,
+      contentType,
     });
-    return res.status(200).json({ msg: "pong" });
+    return res.status(401).send('Invalid signature');
   }
 
-  // Store payload minimally
-  events.unshift({
-    id: deliveryId,
-    type: ghEvent,
-    received_at: new Date().toISOString(),
-    payload: req.body,
-  });
+  // Parse payload into JS object:
+  let payload = null;
+  try {
+    if (contentType.includes('application/json')) {
+      payload = JSON.parse(raw.toString('utf8'));
+    } else if (contentType.includes('application/x-www-form-urlencoded')) {
+      // GitHub may send body like: payload=%7B...%7D
+      const s = raw.toString('utf8');
+      const params = new URLSearchParams(s);
+      // prefer "payload" key if present
+      if (params.has('payload')) {
+        payload = JSON.parse(params.get('payload'));
+      } else {
+        // else attempt parsing entire body as JSON
+        try { payload = JSON.parse(s); } catch (e) { payload = { form: Object.fromEntries(params) }; }
+      }
+    } else {
+      // fallback: try parse JSON
+      payload = JSON.parse(raw.toString('utf8'));
+    }
+  } catch (err) {
+    console.warn('Failed parsing payload', err.message);
+    payload = { parse_error: err.message, raw: raw.toString('utf8').slice(0, 2000) };
+  }
 
-  // keep only last N in memory
+  // store in-memory (ephemeral)
+  if (!global.__gh_events) global.__gh_events = [];
+  const events = global.__gh_events;
+  events.unshift({
+    id: delivery || Math.random().toString(36).slice(2),
+    event,
+    received_at: new Date().toISOString(),
+    payload,
+  });
   if (events.length > 200) events.length = 200;
 
-  // Respond quickly
-  res.status(200).send("ok");
+  // respond quickly
+  res.status(200).json({ ok: true, received_event: event, id: delivery });
 };
