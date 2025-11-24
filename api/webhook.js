@@ -101,6 +101,9 @@ module.exports = async (req, res) => {
     received_at: new Date().toISOString(),
     payload,
   });
+  console.log('received webhook', { event: req.headers['x-github-event'], id: req.headers['x-github-delivery'] });
+  console.log('events array length now', events.length);
+
   if (events.length > 200) events.length = 200;
 
   // respond quickly
